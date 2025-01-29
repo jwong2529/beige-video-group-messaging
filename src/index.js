@@ -1,99 +1,102 @@
-require("dotenv").config();
+require('dotenv').config({ path: '../.env' });
 const express = require("express");
 const bodyParser = require("body-parser");
 const twilio = require("twilio");
 
 const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
 // Twilio credentials
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 const twilioClient = twilio(accountSid, authToken);
+const twilioPhoneNumber = process.env.TWILIO_PHONE_NUMBER;
 const CONVERSATIONS_SERVICE_SID = process.env.TWILIO_CONVERSATIONS_SERVICE_SID;
 
-// Create a new masked conversation
-async function createConversation() {
+// In-memory storage for conversation mappings (replace with a database in production)
+const conversations = {};
+
+// Endpoint to start a conversation between a Client and a Content Producer
+app.post('/start-conversation', async (req, res) => {
+    const { clientNumber, contentProducerNumber } = req.body;
+
+    if (!clientNumber || !contentProducerNumber) {
+        return res.status(400).json({ error: 'Client and Content Producer numbers are required.' });
+    }
+
     try {
+        // Create a new conversation
         const conversation = await twilioClient.conversations.v1.conversations.create({
-            friendlyName: "Anonymized Client-Producer Chat"
+            friendlyName: 'Client-ContentProducer Chat',
         });
-        console.log("Conversation Created:", conversation.sid);
-        return conversation.sid;
-    } catch (error) {
-        console.error("Error creating conversation:", error);
-    }
-}
 
-// Add a participant (Client or Content Producer)
-async function addParticipant(conversationSid, userPhoneNumber) {
-    try {
-        await twilioClient.conversations.v1.conversations(conversationSid)
-            .participants
-            .create({
-                messagingBinding: {
-                    address: userPhoneNumber,
-                    proxyAddress: process.env.TWILIO_PHONE_NUMBER
-                }
+        // Add the Client and Content Producer to the conversation
+        await twilioClient.conversations.v1
+            .conversations(conversation.sid)
+            .participants.create({
+                'messagingBinding.address': clientNumber,
+                'messagingBinding.proxyAddress': twilioPhoneNumber,
             });
-        console.log(`Adding ${userPhoneNumber} to conversation ${conversationSid}`);
+
+        await twilioClient.conversations.v1
+            .conversations(conversation.sid)
+            .participants.create({
+                'messagingBinding.address': contentProducerNumber,
+                'messagingBinding.proxyAddress': twilioPhoneNumber,
+            });
+
+        // Store the conversation SID and participant numbers in memory
+        conversations[conversation.sid] = {
+            clientNumber,
+            contentProducerNumber,
+        };
+
+        res.status(200).json({
+            message: 'Conversation started successfully!',
+            conversationSid: conversation.sid,
+        });
     } catch (error) {
-        console.error("Error adding participant:", error);
-    }
-}
-
-// API to start a new masked conversation between a Client and CP
-app.post("/start-conversation", async(req, res) => {
-    const { clientPhone, contentProducerPhone } = req.body;
-
-    if (!clientPhone || !contentProducerPhone) {
-        return res.status(400).send("Both clientPhone and contentProducerPhone are required.");
-    }
-
-    try {
-        const conversationSid = await createConversation();
-        await addParticipant(conversationSid, clientPhone);
-        await addParticipant(conversationSid, contentProducerPhone);
-
-        res.json({ message: "Conversation started", conversationSid });
-    } catch (error) {
-        res.status(500).send(`Error: ${error.message}`);
+        console.error('Error starting conversation:', error);
+        res.status(500).json({ error: 'Failed to start conversation.' });
     }
 });
 
-// Webhook to handle incoming messages
-app.post("/incoming", async (req, res) => {
-    const { From, Body, ConversationSid } = req.body;
+// Endpoint to handle incoming messages from Twilio
+app.post('/incoming-message', async (req, res) => {
+    const from = req.body.From;
+    const to = req.body.To;
+    const body = req.body.Body;
 
-    // Check if ConversationSid and message body exist
-    if (!ConversationSid || !Body || !From) {
-        return res.status(400).send("Invalid message or missing ConversationSid.");
+    // Find the conversation SID based on the sender's number
+    const conversationSid = Object.keys(conversations).find((sid) => {
+        const conversation = conversations[sid];
+        return conversation.clientNumber === from || conversation.contentProducerNumber === from;
+    });
+
+    if (!conversationSid) {
+        return res.status(404).json({ error: 'Conversation not found.' });
     }
 
+    // Determine the recipient
+    const conversation = conversations[conversationSid];
+    const recipientNumber =
+        from === conversation.clientNumber
+            ? conversation.contentProducerNumber
+            : conversation.clientNumber;
+
+    // Send the message to the recipient via Twilio
     try {
-        // Find the participant (either Content Producer or Client)
-        const participant = await twilioClient.conversations.v1.conversations(ConversationSid)
-            .participants
-            .list({ limit: 1 }); // Assume there's one participant for simplicity
+        await twilioClient.messages.create({
+            body: body,
+            from: twilioPhoneNumber,
+            to: recipientNumber,
+        });
 
-        // Determine the recipient based on sender's phone number
-        const senderPhone = From;
-        const senderIsClient = participant[0].messagingBinding.address === senderPhone;
-        const recipientPhone = senderIsClient ? "Content Producer" : "Client";
-
-        // Forward the message to the other participant
-        const messageSent = await twilioClient.conversations.v1.conversations(ConversationSid)
-            .messages
-            .create({
-                body: Body,
-                from: senderPhone, // This sends the message back to the other participant
-            });
-
-        res.json({ message: "Message forwarded.", sid: messageSent.sid });
+        res.status(200).json({ message: 'Message forwarded successfully!' });
     } catch (error) {
-        console.error("Error processing incoming message:", error);
-        res.status(500).send(`Error: ${error.message}`);
+        console.error('Error forwarding message:', error);
+        res.status(500).json({ error: 'Failed to forward message.' });
     }
 });
 
