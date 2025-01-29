@@ -10,73 +10,66 @@ app.use(bodyParser.json());
 // Twilio credentials
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
+const proxyServiceSid = process.env.TWILIO_PROXY_SERVICE_SID;
 const twilioClient = twilio(accountSid, authToken);
-const twilioNumber = process.env.TWILIO_PHONE_NUMBER;
 
-// Helper function to send anonymized messages
-function sendMessage(fromAlias, toAlias, message, contacts) {
-    const from = contacts[fromAlias];
-    const to = contacts[toAlias];
-
-    if (!from || !to) {
-        throw new Error("Invalid alias used.");
+// Create a Proxy Session
+async function createSession() {
+    try {
+        const session = await twilioClient.proxy.v1.services(proxyServiceSid).sessions.create();
+        console.log(`Session created: ${session.sid}`);
+        return session.sid;
+    } catch (error) {
+        console.error("Error creating session:", error.message);
     }
-
-    return twilioClient.messages.create({
-        body: `${fromAlias}: ${message}`,
-        from: twilioNumber,
-        to: to,
-    });
 }
 
-// Handle incoming messages
-app.post("/messages", async(req, res) => {
-    const { sender, recipients, message, contacts } = req.body;
-
-    if (!contacts || !contacts["Content Producer"] || !contacts["Client"] || !contacts["Project Manager"]) {
-        return res.status(400).send("Contacts object must include 'Content Producer', 'Client', and 'Project Manager'.");
-    }
-    if (!sender || !recipients || !message) {
-        return res.status(400).send("Missing required fields: sender, recipients, message.");
-    }
-
+// Add a Participant to the Session
+async function addParticipant(sessionSid, phoneNumber, alias) {
     try {
-        const promises = recipients.map((recipient) => 
-            sendMessage(sender, recipient, message, contacts)
-        );
-        await Promise.all(promises);
-        res.send("Messages sent!");
+        const participant = await twilioClient.proxy.v1.services(proxyServiceSid)
+            .sessions(sessionSid)
+            .participants.create({
+                friendlyName: alias,
+                identifier: phoneNumber,
+            });
+        console.log(`${alias} added with Proxy Number: ${participant.proxyIdentifier}`);
+        return participant.proxyIdentifier;
     } catch (error) {
-        res.status(500).send(`Error sending messages: ${error.message}`);
+        console.error(`Error adding ${alias}:`, error.message);
     }
-    
+}
+
+// Initialize and create session for a client and content producer
+app.post("/start-session", async (req, res) => {
+    try {
+        const sessionSid = await createSession();
+        const clientProxy = await addParticipant(sessionSid, process.env.CLIENT_PHONE_NUMBER, "Client");
+        const cpProxy = await addParticipant(sessionSid, process.env.CONTENT_PRODUCER_PHONE_NUMBER, "Content Producer");
+
+        res.json({
+            message: "Session started successfully.",
+            sessionSid, 
+            clientProxyNumber: clientProxy,
+            contentProducerProxyNumber: cpProxy
+        });
+    } catch (error) {
+        res.status(500).send(`Error starting session: ${error.message}`);
+    }
 });
 
-// Webhook for handling inbound messages
-app.post("/incoming", async (req, res) => {
-    const { From, Body, contacts } = req.body; 
-
-    if (!contacts || !contacts["Content Producer"] || !contacts["Client"] || !contacts["Project Manager"]) {
-        return res.status(400).send("Contacts object must include 'Content Producer', 'Client', and 'Project Manager'.");
-    }
-
-    const senderAlias = Object.keys(contacts).find(alias => contacts[alias] === From);
-
-    if (!senderAlias) {
-        return res.status(400).send("Unknown sender.");
-    }
+// Close session
+app.post("/end-session", async (req, res) => {
+    const { sessionSid } = req.body;
+    if (!sessionSid) return res.status(400).send("Session SID required.");
 
     try {
-        // Forward the message to other group members
-        const recipients = Object.keys(contacts).filter(alias => alias !== senderAlias);
-        const promises = recipients.map(recipientAlias => 
-            sendMessage(senderAlias, recipientAlias, Body, contacts)
-        );
-        await Promise.all(promises);
-
-        res.send("Message forwarded to group.");
+        await twilioClient.proxy.v1.services(proxyServiceSid)
+            .sessions(sessionSid)
+            .remove();
+        res.send("Session ended.")
     } catch (error) {
-        res.status(500).send(`Error processing message: ${error.message}`);
+        res.status(500).send(`Error ending session: ${error.message}`);
     }
 });
 
