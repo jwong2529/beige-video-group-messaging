@@ -64,8 +64,37 @@ app.post("/start-conversation", async(req, res) => {
 
 // Webhook to handle incoming messages
 app.post("/incoming", async (req, res) => {
-    console.log("Incoming message:", req.body);
-    res.send("Message received.");
+    const { From, Body, ConversationSid } = req.body;
+
+    // Check if ConversationSid and message body exist
+    if (!ConversationSid || !Body || !From) {
+        return res.status(400).send("Invalid message or missing ConversationSid.");
+    }
+
+    try {
+        // Find the participant (either Content Producer or Client)
+        const participant = await twilioClient.conversations.v1.conversations(ConversationSid)
+            .participants
+            .list({ limit: 1 }); // Assume there's one participant for simplicity
+
+        // Determine the recipient based on sender's phone number
+        const senderPhone = From;
+        const senderIsClient = participant[0].messagingBinding.address === senderPhone;
+        const recipientPhone = senderIsClient ? "Content Producer" : "Client";
+
+        // Forward the message to the other participant
+        const messageSent = await twilioClient.conversations.v1.conversations(ConversationSid)
+            .messages
+            .create({
+                body: Body,
+                from: senderPhone, // This sends the message back to the other participant
+            });
+
+        res.json({ message: "Message forwarded.", sid: messageSent.sid });
+    } catch (error) {
+        console.error("Error processing incoming message:", error);
+        res.status(500).send(`Error: ${error.message}`);
+    }
 });
 
 // Start server
