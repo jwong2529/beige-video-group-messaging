@@ -10,67 +10,62 @@ app.use(bodyParser.json());
 // Twilio credentials
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
-const proxyServiceSid = process.env.TWILIO_PROXY_SERVICE_SID;
 const twilioClient = twilio(accountSid, authToken);
+const CONVERSATIONS_SERVICE_SID = process.env.TWILIO_CONVERSATIONS_SERVICE_SID;
 
-// Create a Proxy Session
-async function createSession() {
+// Create a new masked conversation
+async function createConversation() {
     try {
-        const session = await twilioClient.proxy.v1.services(proxyServiceSid).sessions.create();
-        console.log(`Session created: ${session.sid}`);
-        return session.sid;
-    } catch (error) {
-        console.error("Error creating session:", error.message);
-    }
-}
-
-// Add a Participant to the Session
-async function addParticipant(sessionSid, phoneNumber, alias) {
-    try {
-        const participant = await twilioClient.proxy.v1.services(proxyServiceSid)
-            .sessions(sessionSid)
-            .participants.create({
-                friendlyName: alias,
-                identifier: phoneNumber,
-            });
-        console.log(`${alias} added with Proxy Number: ${participant.proxyIdentifier}`);
-        return participant.proxyIdentifier;
-    } catch (error) {
-        console.error(`Error adding ${alias}:`, error.message);
-    }
-}
-
-// Initialize and create session for a client and content producer
-app.post("/start-session", async (req, res) => {
-    try {
-        const sessionSid = await createSession();
-        const clientProxy = await addParticipant(sessionSid, process.env.CLIENT_PHONE_NUMBER, "Client");
-        const cpProxy = await addParticipant(sessionSid, process.env.CONTENT_PRODUCER_PHONE_NUMBER, "Content Producer");
-
-        res.json({
-            message: "Session started successfully.",
-            sessionSid, 
-            clientProxyNumber: clientProxy,
-            contentProducerProxyNumber: cpProxy
+        const conversation = await twilioClient.conversations.v1.conversations.create({
+            friendlyName: "Anonymized Client-Producer Chat"
         });
+        console.log("Conversation Created:", conversation.sid);
+        return conversation.sid;
     } catch (error) {
-        res.status(500).send(`Error starting session: ${error.message}`);
+        console.error("Error creating conversation:", error);
+    }
+}
+
+// Add a participant (Client or Content Producer)
+async function addParticipant(conversationSid, userPhoneNumber) {
+    try {
+        await twilioClient.conversations.v1.conversations(conversationSid)
+            .participants
+            .create({
+                messagingBinding: {
+                    address: userPhoneNumber,
+                    proxyAddress: process.env.TWILIO_PHONE_NUMBER
+                }
+            });
+        console.log(`Adding ${userPhoneNumber} to conversation ${conversationSid}`);
+    } catch (error) {
+        console.error("Error adding participant:", error);
+    }
+}
+
+// API to start a new masked conversation between a Client and CP
+app.post("/start-conversation", async(req, res) => {
+    const { clientPhone, contentProducerPhone } = req.body;
+
+    if (!clientPhone || !contentProducerPhone) {
+        return res.status(400).send("Both clientPhone and contentProducerPhone are required.");
+    }
+
+    try {
+        const conversationSid = await createConversation();
+        await addParticipant(conversationSid, clientPhone);
+        await addParticipant(conversationSid, contentProducerPhone);
+
+        res.json({ message: "Conversation started", conversationSid });
+    } catch (error) {
+        res.status(500).send(`Error: ${error.message}`);
     }
 });
 
-// Close session
-app.post("/end-session", async (req, res) => {
-    const { sessionSid } = req.body;
-    if (!sessionSid) return res.status(400).send("Session SID required.");
-
-    try {
-        await twilioClient.proxy.v1.services(proxyServiceSid)
-            .sessions(sessionSid)
-            .remove();
-        res.send("Session ended.")
-    } catch (error) {
-        res.status(500).send(`Error ending session: ${error.message}`);
-    }
+// Webhook to handle incoming messages
+app.post("/incoming", async (req, res) => {
+    console.log("Incoming message:", req.body);
+    res.send("Message received.");
 });
 
 // Start server
